@@ -1,5 +1,8 @@
 package sqlutil
 
+// The code in this file is adapted from similar code in
+// https://github.com/chain/chain/tree/1.2-stable/core/leader.
+
 import (
 	"context"
 	"crypto/rand"

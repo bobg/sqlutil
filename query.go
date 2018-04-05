@@ -6,7 +6,8 @@ import (
 	"reflect"
 )
 
-// Cribbed from github.com/chain/database/pg
+// The code in this file is adapted from similar code in
+// https://github.com/chain/chain/tree/1.2-stable/database/pg.
 
 // The type of "error"
 var errorInterface = reflect.TypeOf((*error)(nil)).Elem()
