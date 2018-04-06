@@ -40,7 +40,7 @@ func Migrate(ctx context.Context, db DB, migrations []string) error {
 			}
 			defer dbtx.Rollback()
 
-			err = dbtx.ExecContext(ctx, m)
+			_, err = dbtx.ExecContext(ctx, m)
 			if err != nil {
 				return err
 			}
@@ -48,7 +48,7 @@ func Migrate(ctx context.Context, db DB, migrations []string) error {
 			h := sha256.Sum256([]byte(m))
 
 			const addQ = `INSERT INTO migrations (hash) VALUES ($1)`
-			err = dbtx.ExecContext(ctx, addQ, h[:])
+			_, err = dbtx.ExecContext(ctx, addQ, h[:])
 			if err != nil {
 				return err
 			}
