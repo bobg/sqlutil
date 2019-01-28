@@ -24,12 +24,11 @@ type Lease struct {
 
 var ErrNoUpdate = errors.New("no rows updated")
 
-// NewLease attempts to acquire a lease from a given DB table for a
-// given amount of time.
+// NewLease attempts to acquire a lease from a given DB table for a given amount of time.
 //
 // The table must have a column "lease_key" to hold a 16-byte string;
-// a column "lease_expiration" to hold a timestamp (a DATETIME); and
-// column defined like:
+// a column "lease_expiration" to hold a timestamp (a DATETIME);
+// and a column defined like:
 //   singleton BOOL NOT NULL UNIQUE CHECK (singleton) DEFAULT true
 // which ensures the table can only ever contain a single row.
 func NewLease(ctx context.Context, db ExecerContext, table string, dur time.Duration) (*Lease, error) {
