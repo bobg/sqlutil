@@ -1,102 +1,170 @@
 package sqlutil
 
-// The code in this file is adapted from similar code in
-// https://github.com/chain/chain/tree/1.2-stable/core/leader.
-
 import (
 	"context"
 	"crypto/rand"
-	"errors"
+	"encoding/hex"
 	"fmt"
 	"time"
+
+	"github.com/pkg/errors"
 )
 
-type LeaseKeyType [16]byte
+// Lessor is a provider of leases.
+// It's a wrapper around a database handle
+// that specifies the name of the database's lease-info table,
+// and the important column names in that table.
+type Lessor struct {
+	db ExecerContext
 
-// Lease represents the exclusive acquisition of a resource until a certain deadline.
+	// Table is the name of the db table holding lease info.
+	// The default if this is unspecified is "leases".
+	Table string
+
+	// Name is the name of the column in the lease-info table that holds a lease's name.
+	// The column must have a string-compatible type (like TEXT).
+	// It must be uniquely indexed (and would make a suitable PRIMARY KEY for the table).
+	// The default if this is unspecified is "name".
+	Name string
+
+	// Exp is the name of the column in the lease-info table that holds a lease's expiration time.
+	// The column must have a time.Time-compatible type (like DATETIME).
+	// For performance, a non-unique index should be defined on it.
+	// The default if this is unspecified is "exp".
+	Exp string
+
+	// Key is the name of the column in the lease-info table that holds the per-lease key.
+	// It must have a type capable of storing a 32-byte string.
+	// The default if this is unspecified is "key".
+	Key string
+}
+
+const (
+	defaultTable = "leases"
+	defaultName  = "name"
+	defaultExp   = "exp"
+	defaultKey   = "key"
+)
+
+func NewLessor(db ExecerContext) *Lessor {
+	return &Lessor{db: db}
+}
+
+func (l *Lessor) tableName() string {
+	if l.Table == "" {
+		return defaultTable
+	}
+	return l.Table
+}
+
+func (l *Lessor) nameName() string {
+	if l.Name == "" {
+		return defaultName
+	}
+	return l.Name
+}
+
+func (l *Lessor) expName() string {
+	if l.Exp == "" {
+		return defaultExp
+	}
+	return l.Exp
+}
+
+func (l *Lessor) keyName() string {
+	if l.Key == "" {
+		return defaultKey
+	}
+	return l.Key
+}
+
+// Acquire attempts to acquire the lease named `name` from a Lessor.
+// This will fail (without blocking) if that lease is already held and unexpired.
+// If the lease is acquired,
+// it expires at `exp`.
+// It is also assigned a unique Key that is required in Renew and Release operations.
+func (l *Lessor) Acquire(ctx context.Context, name string, exp time.Time) (*Lease, error) {
+	const delQFmt = `DELETE FROM %s WHERE %s < $1`
+	delQ := fmt.Sprintf(delQFmt, l.tableName(), l.expName())
+	_, err := l.db.ExecContext(ctx, delQ, time.Now())
+	if err != nil {
+		return nil, errors.Wrap(err, "deleting stale leases")
+	}
+
+	var key [16]byte
+	_, err = rand.Reader.Read(key[:])
+	if err != nil {
+		return nil, errors.Wrap(err, "computing key")
+	}
+	keyHex := hex.EncodeToString(key[:])
+
+	const insQFmt = `INSERT INTO %s (%s, %s, %s) VALUES ($1, $2, $3)`
+	insQ := fmt.Sprintf(insQFmt, l.tableName(), l.nameName(), l.expName(), l.keyName())
+	_, err = l.db.ExecContext(ctx, insQ, name, exp, keyHex)
+	return &Lease{
+		Lessor: l,
+		Name:   name,
+		Exp:    exp,
+		Key:    keyHex,
+	}, errors.Wrap(err, "inserting into database")
+}
+
+// Lease is the type of a lease acquired from a Lessor.
+// Its fields are exported so that callers can port a lease between processes.
+// (The receiving process copies the sending process's values for Name, Exp, and Key,
+// and assigns its own value for Lessor.)
 type Lease struct {
-	Ctx, ParentCtx context.Context
-	Cancel         context.CancelFunc
-	DB             ExecerContext
-	Table          string
-	Key            LeaseKeyType
+	Lessor *Lessor `json:"-"`
+	Name   string
+	Exp    time.Time
+	Key    string
 }
 
-var ErrNoUpdate = errors.New("no rows updated")
-
-// NewLease attempts to acquire a lease from a given DB table for a given amount of time.
-//
-// The table must have a column "lease_key" to hold a 16-byte string;
-// a column "lease_expiration" to hold a timestamp (a DATETIME);
-// and a column defined like:
-//   singleton BOOL NOT NULL UNIQUE CHECK (singleton) DEFAULT true
-// which ensures the table can only ever contain a single row.
-func NewLease(ctx context.Context, db ExecerContext, table string, dur time.Duration) (*Lease, error) {
-	now := time.Now()
-
-	const delQFmt = `DELETE FROM %s WHERE lease_expiration < $1`
-	delQ := fmt.Sprintf(delQFmt, table)
-	_, err := db.ExecContext(ctx, delQ, now)
+// Renew updates the expiration time of the lease.
+// It fails if the lease is expired or otherwise not held.
+func (l *Lease) Renew(ctx context.Context, exp time.Time) error {
+	const updQFmt = `UPDATE %s SET %s = $1 WHERE %s = $2 AND %s = $3 AND %s > $4`
+	updQ := fmt.Sprintf(
+		updQFmt,
+		l.Lessor.tableName(),
+		l.Lessor.expName(),
+		l.Lessor.nameName(),
+		l.Lessor.keyName(),
+		l.Lessor.expName(),
+	)
+	res, err := l.Lessor.db.ExecContext(ctx, updQ, exp, l.Name, l.Key, time.Now())
 	if err != nil {
-		return nil, err
+		return errors.Wrap(err, "updating database")
 	}
-
-	var key LeaseKeyType
-	_, err = rand.Read(key[:])
+	aff, err := res.RowsAffected()
 	if err != nil {
-		return nil, err
+		return errors.Wrap(err, "counting affected rows")
 	}
-
-	exp := now.Add(dur)
-
-	const insQFmt = `INSERT INTO %s (lease_key, lease_expiration) VALUES ($1, $2)`
-	insQ := fmt.Sprintf(insQFmt, table)
-	_, err = db.ExecContext(ctx, insQ, key[:], exp)
-	if err != nil {
-		return nil, err
+	if aff == 0 {
+		return errors.New("could not renew")
 	}
-
-	ctx2, cancel := context.WithDeadline(ctx, exp)
-
-	l := &Lease{
-		ParentCtx: ctx,
-		Ctx:       ctx2,
-		Cancel:    cancel,
-		DB:        db,
-		Table:     table,
-		Key:       key,
-	}
-	return l, nil
-}
-
-func (l *Lease) End() error {
-	l.Cancel()
-	const delQFmt = `DELETE FROM %s WHERE lease_key = $1`
-	delQ := fmt.Sprintf(delQFmt, l.Table)
-	_, err := l.DB.ExecContext(l.ParentCtx, delQ, l.Key[:])
-	return err
-}
-
-func (l *Lease) Renew(dur time.Duration) error {
-	now := time.Now()
-	exp := now.Add(dur)
-
-	const updQFmt = `UPDATE %s SET lease_expiration = $1 WHERE key = $2 AND lease_expiration < $3`
-	updQ := fmt.Sprintf(updQFmt, l.Table)
-	res, err := l.DB.ExecContext(l.Ctx, updQ, exp, l.Key[:], now)
-	if err != nil {
-		return err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n == 0 {
-		return ErrNoUpdate
-	}
-	l.Cancel()
-	ctx, cancel := context.WithDeadline(l.ParentCtx, exp)
-	l.Ctx = ctx
-	l.Cancel = cancel
 	return nil
+}
+
+// Release releases the lease.
+func (l *Lease) Release(ctx context.Context) error {
+	const delQFmt = `DELETE FROM %s WHERE %s = $1 AND %s = $2`
+	delQ := fmt.Sprintf(
+		delQFmt,
+		l.Lessor.tableName(),
+		l.Lessor.nameName(),
+		l.Lessor.keyName(),
+	)
+	_, err := l.Lessor.db.ExecContext(ctx, delQ, l.Name, l.Key)
+	return errors.Wrap(err, "deleting from database")
+}
+
+// Context produces a context object with a deadline equal to the lease's expiration time.
+// Callers should be sure to call the associated cancel function before the context goes out of scope.
+// E.g.:
+//
+//   ctx, cancel := lease.Context(ctx)
+//   defer cancel()
+func (l *Lease) Context(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithDeadline(ctx, l.Exp)
 }
