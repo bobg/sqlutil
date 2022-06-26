@@ -2,8 +2,11 @@ package sqlutil
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"reflect"
+
+	"github.com/pkg/errors"
 )
 
 // The code in this file is adapted from similar code in
@@ -101,4 +104,52 @@ func ForQueryRows(ctx context.Context, db QueryerContext, query string, args ...
 		}
 	}
 	return rows.Err()
+}
+
+// QueryRowContext is just like the db.QueryRowContext method but additionally detects whether the query produces more than one row.
+// In that case the Row.Scan method returns ErrMultipleRows.
+func QueryRowContext(ctx context.Context, db QueryerContext, query string, args ...interface{}) *Row {
+	rows, err := db.QueryContext(ctx, query, args...)
+	return &Row{rows: rows, err: err}
+}
+
+// ErrMultipleRows is the error produced by Row.Scan when the query has produced more than one row.
+var ErrMultipleRows = errors.New("multiple rows")
+
+// Row is the type of result produced by QueryRowContext.
+// It is the same as "database/sql".Rows,
+// except that it can return the ErrMultipleRows error.
+type Row struct {
+	rows *sql.Rows
+	err  error
+}
+
+// Err returns the error in r, if any.
+func (r *Row) Err() error {
+	return r.err
+}
+
+// Scan scans the values in r and assigns them to the pointers supplied as arguments.
+// See "database/sql".Row.Scan.
+// Note that when this function returns ErrMultipleRows,
+// the pointers are populated anyway,
+// with values from the first row of query results.
+func (r *Row) Scan(dest ...interface{}) error {
+	if r.rows == nil {
+		return r.err
+	}
+
+	defer r.rows.Close()
+
+	if !r.rows.Next() {
+		return sql.ErrNoRows
+	}
+	err := r.rows.Scan(dest...)
+	if err != nil {
+		return err
+	}
+	if r.rows.Next() {
+		return ErrMultipleRows
+	}
+	return nil
 }
